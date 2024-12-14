@@ -32,4 +32,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
 
     -- Set search_path for supabase_auth_admin
     ALTER USER supabase_auth_admin SET search_path = 'auth';
+
+    -- Create another Database for other service, such miniflux
+    CREATE DATABASE miniflux;
 EOSQL
