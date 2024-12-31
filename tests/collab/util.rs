@@ -121,6 +121,21 @@ pub fn alex_software_engineer_story() -> Vec<&'static str> {
   ]
 }
 
+pub fn snowboarding_in_japan_plan() -> Vec<&'static str> {
+  vec![
+    "Our trip begins with a flight from American to Tokyo on January 7th.",
+    "In Tokyo, we’ll spend three days, from February 7th to 10th, exploring the city’s tech scene and snowboarding gear shops.",
+    "We’ll visit popular spots like Shibuya, Shinjuku, and Odaiba before heading to our next destination.",
+    "From Tokyo, we fly to Sendai and then travel to Zao Onsen for a 3-day stay from February 10th to 14th.",
+    "Zao Onsen is famous for its beautiful snow and the iconic ice trees, which will make for a unique snowboarding experience.",
+    "After Zao Onsen, we fly from Sendai to Chitose, then head to Sapporo for a 2-day visit, exploring the city’s vibrant atmosphere and winter attractions.",
+    "On the next day, we’ll spend time at Sapporo Tein, a ski resort that offers great runs and stunning views of the city and the sea.",
+    "Then we head to Rusutsu for 5 days, one of the top ski resorts in Japan, known for its deep powder snow and extensive runs.",
+    "Finally, we’ll fly back to Singapore after experiencing some of the best snowboarding Japan has to offer.",
+    "Ski resorts to visit include Niseko (二世谷), Rusutsu (留寿都), Sapporo Tein (札幌和海景), and Zao Onsen Ski Resort (冰树).",
+  ]
+}
+
 pub fn alex_banker_story() -> Vec<&'static str> {
   vec![
     "Alex is a banker who spends most of their time working with numbers.",
@@ -187,5 +202,99 @@ pub async fn redis_connection_manager() -> ConnectionManager {
         attempt += 1;
       },
     }
+  }
+}
+
+use std::io::{BufReader, Read};
+
+use collab::preclude::MapExt;
+use flate2::bufread::GzDecoder;
+use serde::Deserialize;
+use yrs::{GetString, Text, TextRef};
+
+use client_api_test::CollabRef;
+
+/// (position, delete length, insert content).
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq)]
+pub struct TestPatch(pub usize, pub usize, pub String);
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq)]
+pub struct TestTxn {
+  // time: String, // ISO String. Unused.
+  pub patches: Vec<TestPatch>,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq)]
+pub struct TestScenario {
+  #[serde(default)]
+  pub using_byte_positions: bool,
+
+  #[serde(rename = "startContent")]
+  pub start_content: String,
+  #[serde(rename = "endContent")]
+  pub end_content: String,
+
+  pub txns: Vec<TestTxn>,
+}
+
+impl TestScenario {
+  /// Load the testing data at the specified file. If the filename ends in .gz, it will be
+  /// transparently uncompressed.
+  ///
+  /// This method panics if the file does not exist, or is corrupt. It'd be better to have a try_
+  /// variant of this method, but given this is mostly for benchmarking and testing, I haven't felt
+  /// the need to write that code.
+  pub fn open(fpath: &str) -> TestScenario {
+    // let start = SystemTime::now();
+    // let mut file = File::open("benchmark_data/automerge-paper.json.gz").unwrap();
+    let file = std::fs::File::open(fpath).unwrap();
+
+    let mut reader = BufReader::new(file);
+    // We could pass the GzDecoder straight to serde, but it makes it way slower to parse for
+    // some reason.
+    let mut raw_json = vec![];
+
+    if fpath.ends_with(".gz") {
+      let mut reader = GzDecoder::new(reader);
+      reader.read_to_end(&mut raw_json).unwrap();
+    } else {
+      reader.read_to_end(&mut raw_json).unwrap();
+    }
+
+    let data: TestScenario = serde_json::from_reader(raw_json.as_slice()).unwrap();
+    data
+  }
+
+  pub async fn execute(&self, collab: CollabRef, step_count: usize) -> String {
+    let mut i = 0;
+    for t in self.txns.iter().take(step_count) {
+      i += 1;
+      if i % 10_000 == 0 {
+        tracing::trace!("Executed {}/{} steps", i, step_count);
+      }
+      let mut lock = collab.write().await;
+      let collab = lock.borrow_mut();
+      let mut txn = collab.context.transact_mut();
+      let txt = collab.data.get_or_init_text(&mut txn, "text-id");
+      for patch in t.patches.iter() {
+        let at = patch.0;
+        let delete = patch.1;
+        let content = patch.2.as_str();
+
+        if delete != 0 {
+          txt.remove_range(&mut txn, at as u32, delete as u32);
+        }
+        if !content.is_empty() {
+          txt.insert(&mut txn, at as u32, content);
+        }
+      }
+    }
+
+    // validate after applying all patches
+    let lock = collab.read().await;
+    let collab = lock.borrow();
+    let txn = collab.context.transact();
+    let txt: TextRef = collab.data.get_with_txn(&txn, "text-id").unwrap();
+    txt.get_string(&txn)
   }
 }

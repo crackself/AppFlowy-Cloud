@@ -40,10 +40,13 @@ use appflowy_collaborate::actix_ws::server::RealtimeServerActor;
 use appflowy_collaborate::collab::cache::CollabCache;
 use appflowy_collaborate::collab::storage::CollabStorageImpl;
 use appflowy_collaborate::command::{CLCommandReceiver, CLCommandSender};
-use appflowy_collaborate::indexer::{IndexerProvider, IndexerScheduler};
 use appflowy_collaborate::snapshot::SnapshotControl;
 use appflowy_collaborate::CollaborationServer;
+use collab_stream::stream_router::{StreamRouter, StreamRouterOptions};
 use database::file::s3_client_impl::{AwsS3BucketClientImpl, S3BucketStorage};
+use indexer::collab_indexer::IndexerProvider;
+use indexer::scheduler::{IndexerConfiguration, IndexerScheduler};
+use infra::env_util::get_env_var;
 use mailer::sender::Mailer;
 use snowflake::Snowflake;
 use tonic_proto::history::history_client::HistoryClient;
@@ -132,9 +135,10 @@ pub async fn run_actix_server(
     state.realtime_access_control.clone(),
     state.metrics.realtime_metrics.clone(),
     rt_cmd_recv,
+    state.redis_stream_router.clone(),
+    state.redis_connection_manager.clone(),
     Duration::from_secs(config.collab.group_persistence_interval_secs),
-    config.collab.edit_state_max_count,
-    config.collab.edit_state_max_secs,
+    Duration::from_secs(config.collab.group_prune_grace_period_secs),
     state.indexer_scheduler.clone(),
   )
   .await
@@ -244,7 +248,8 @@ pub async fn init_state(config: &Config, rt_cmd_tx: CLCommandSender) -> Result<A
 
   // Redis
   info!("Connecting to Redis...");
-  let redis_conn_manager = get_redis_client(config.redis_uri.expose_secret()).await?;
+  let (redis_conn_manager, redis_stream_router) =
+    get_redis_client(config.redis_uri.expose_secret(), config.redis_worker_count).await?;
 
   info!("Setup AppFlowy AI: {}", config.appflowy_ai.url());
   let appflowy_ai_client = AppFlowyAIClient::new(&config.appflowy_ai.url());
@@ -318,12 +323,25 @@ pub async fn init_state(config: &Config, rt_cmd_tx: CLCommandSender) -> Result<A
   let mailer = get_mailer(&config.mailer).await?;
 
   info!("Setting up Indexer scheduler...");
-
+  let embedder_config = IndexerConfiguration {
+    enable: get_env_var("APPFLOWY_INDEXER_ENABLED", "true")
+      .parse::<bool>()
+      .unwrap_or(true),
+    openai_api_key: get_env_var("APPFLOWY_AI_OPENAI_API_KEY", ""),
+    embedding_buffer_size: appflowy_collaborate::config::get_env_var(
+      "APPFLOWY_INDEXER_EMBEDDING_BUFFER_SIZE",
+      "5000",
+    )
+    .parse::<usize>()
+    .unwrap_or(5000),
+  };
   let indexer_scheduler = IndexerScheduler::new(
-    IndexerProvider::new(appflowy_ai_client.clone()),
+    IndexerProvider::new(),
     pg_pool.clone(),
     collab_access_control_storage.clone(),
     metrics.embedding_metrics.clone(),
+    embedder_config,
+    redis_conn_manager.clone(),
   );
 
   info!("Application state initialized");
@@ -333,6 +351,7 @@ pub async fn init_state(config: &Config, rt_cmd_tx: CLCommandSender) -> Result<A
     user_cache,
     id_gen: Arc::new(RwLock::new(Snowflake::new(1))),
     gotrue_client,
+    redis_stream_router,
     redis_connection_manager: redis_conn_manager,
     collab_cache,
     collab_access_control_storage,
@@ -365,14 +384,28 @@ fn get_admin_client(
   )
 }
 
-async fn get_redis_client(redis_uri: &str) -> Result<redis::aio::ConnectionManager, Error> {
+async fn get_redis_client(
+  redis_uri: &str,
+  worker_count: usize,
+) -> Result<(redis::aio::ConnectionManager, Arc<StreamRouter>), Error> {
   info!("Connecting to redis with uri: {}", redis_uri);
-  let manager = redis::Client::open(redis_uri)
-    .context("failed to connect to redis")?
+  let client = redis::Client::open(redis_uri).context("failed to connect to redis")?;
+
+  let router = StreamRouter::with_options(
+    &client,
+    StreamRouterOptions {
+      worker_count,
+      xread_streams: 100,
+      xread_block_millis: Some(5000),
+      xread_count: None,
+    },
+  )?;
+
+  let manager = client
     .get_connection_manager()
     .await
     .context("failed to get the connection manager")?;
-  Ok(manager)
+  Ok((manager, router.into()))
 }
 
 pub async fn get_aws_s3_client(s3_setting: &S3Setting) -> Result<aws_sdk_s3::Client, Error> {
@@ -462,6 +495,7 @@ async fn get_mailer(mailer: &MailerSetting) -> Result<AFCloudMailer, Error> {
     mailer.smtp_password.clone(),
     &mailer.smtp_host,
     mailer.smtp_port,
+    mailer.smtp_tls_kind.as_str(),
   )
   .await?;
 

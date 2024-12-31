@@ -30,7 +30,7 @@ chrono = "0.4"
 client-websocket = { workspace = true, features = ["native-tls"] }
 semver = "1.0.22"
 zstd = { version = "0.13.2" }
-
+tokio-tungstenite.workspace = true
 
 collab = { workspace = true, optional = true }
 yrs = { workspace = true, optional = true }
@@ -40,7 +40,7 @@ serde_json.workspace = true
 serde.workspace = true
 app-error = { workspace = true, features = ["tokio_error", "bincode_error"] }
 scraper = { version = "0.17.1", optional = true }
-arc-swap = "1.7"
+arc-swap.workspace = true
 
 shared-entity = { workspace = true }
 collab-rt-entity = { workspace = true }

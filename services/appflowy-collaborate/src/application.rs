@@ -23,18 +23,20 @@ use tracing::info;
 use crate::actix_ws::server::RealtimeServerActor;
 use crate::api::{collab_scope, ws_scope};
 use crate::collab::access_control::CollabStorageAccessControlImpl;
+use access_control::casbin::access::AccessControl;
+use collab_stream::stream_router::{StreamRouter, StreamRouterOptions};
+use database::file::s3_client_impl::AwsS3BucketClientImpl;
+
 use crate::collab::cache::CollabCache;
 use crate::collab::storage::CollabStorageImpl;
 use crate::command::{CLCommandReceiver, CLCommandSender};
-use crate::config::{Config, DatabaseSetting, S3Setting};
-use crate::indexer::{IndexerProvider, IndexerScheduler};
+use crate::config::{get_env_var, Config, DatabaseSetting, S3Setting};
 use crate::pg_listener::PgListeners;
 use crate::snapshot::SnapshotControl;
 use crate::state::{AppMetrics, AppState, UserCache};
 use crate::CollaborationServer;
-use access_control::casbin::access::AccessControl;
-use appflowy_ai_client::client::AppFlowyAIClient;
-use database::file::s3_client_impl::AwsS3BucketClientImpl;
+use indexer::collab_indexer::IndexerProvider;
+use indexer::scheduler::{IndexerConfiguration, IndexerScheduler};
 
 pub struct Application {
   actix_server: Server,
@@ -78,9 +80,10 @@ pub async fn run_actix_server(
     )),
     state.metrics.realtime_metrics.clone(),
     rt_cmd_recv,
+    state.redis_stream_router.clone(),
+    state.redis_connection_manager.clone(),
     Duration::from_secs(config.collab.group_persistence_interval_secs),
-    config.collab.edit_state_max_count,
-    config.collab.edit_state_max_secs,
+    Duration::from_secs(config.collab.group_prune_grace_period_secs),
     state.indexer_scheduler.clone(),
   )
   .await
@@ -102,13 +105,13 @@ pub async fn run_actix_server(
 pub async fn init_state(config: &Config, rt_cmd_tx: CLCommandSender) -> Result<AppState, Error> {
   let metrics = AppMetrics::new();
   let pg_pool = get_connection_pool(&config.db_settings).await?;
-  let ai_client = AppFlowyAIClient::new(&config.ai.url());
 
   // User cache
   let user_cache = UserCache::new(pg_pool.clone()).await;
 
   info!("Connecting to Redis...");
-  let redis_conn_manager = get_redis_client(config.redis_uri.expose_secret()).await?;
+  let (redis_conn_manager, redis_stream_router) =
+    get_redis_client(config.redis_uri.expose_secret(), config.redis_worker_count).await?;
 
   // Pg listeners
   info!("Setting up Pg listeners...");
@@ -151,17 +154,29 @@ pub async fn init_state(config: &Config, rt_cmd_tx: CLCommandSender) -> Result<A
   ));
 
   info!("Setting up Indexer provider...");
+  let embedder_config = IndexerConfiguration {
+    enable: get_env_var("APPFLOWY_INDEXER_ENABLED", "true")
+      .parse::<bool>()
+      .unwrap_or(true),
+    openai_api_key: get_env_var("APPFLOWY_AI_OPENAI_API_KEY", ""),
+    embedding_buffer_size: get_env_var("APPFLOWY_INDEXER_EMBEDDING_BUFFER_SIZE", "2000")
+      .parse::<usize>()
+      .unwrap_or(2000),
+  };
   let indexer_scheduler = IndexerScheduler::new(
-    IndexerProvider::new(ai_client),
+    IndexerProvider::new(),
     pg_pool.clone(),
     collab_storage.clone(),
     metrics.embedding_metrics.clone(),
+    embedder_config,
+    redis_conn_manager.clone(),
   );
 
   let app_state = AppState {
     config: Arc::new(config.clone()),
     pg_listeners,
     user_cache,
+    redis_stream_router,
     redis_connection_manager: redis_conn_manager,
     access_control,
     collab_access_control_storage: collab_storage,
@@ -171,14 +186,28 @@ pub async fn init_state(config: &Config, rt_cmd_tx: CLCommandSender) -> Result<A
   Ok(app_state)
 }
 
-async fn get_redis_client(redis_uri: &str) -> Result<redis::aio::ConnectionManager, Error> {
+async fn get_redis_client(
+  redis_uri: &str,
+  worker_count: usize,
+) -> Result<(redis::aio::ConnectionManager, Arc<StreamRouter>), Error> {
   info!("Connecting to redis with uri: {}", redis_uri);
-  let manager = redis::Client::open(redis_uri)
-    .context("failed to connect to redis")?
+  let client = redis::Client::open(redis_uri).context("failed to connect to redis")?;
+
+  let router = StreamRouter::with_options(
+    &client,
+    StreamRouterOptions {
+      worker_count,
+      xread_streams: 100,
+      xread_block_millis: Some(5000),
+      xread_count: None,
+    },
+  )?;
+
+  let manager = client
     .get_connection_manager()
     .await
     .context("failed to get the connection manager")?;
-  Ok(manager)
+  Ok((manager, router.into()))
 }
 
 async fn get_connection_pool(setting: &DatabaseSetting) -> Result<PgPool, Error> {

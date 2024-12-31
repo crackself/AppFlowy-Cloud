@@ -59,7 +59,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs;
 use tokio::task::spawn_local;
-use tokio::time::interval;
+use tokio::time::{interval, MissedTickBehavior};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::{error, info, trace, warn};
 use uuid::Uuid;
@@ -177,6 +177,7 @@ async fn process_upcoming_tasks(
     .group(group_name, consumer_name)
     .count(10);
   let mut interval = interval(Duration::from_secs(interval_secs));
+  interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
   interval.tick().await;
 
   loop {
@@ -512,7 +513,7 @@ async fn xack_task(
   group_name: &str,
   entry_id: &str,
 ) -> Result<(), ImportError> {
-  redis_client
+  let _: () = redis_client
     .xack(stream_name, group_name, &[entry_id])
     .await
     .map_err(|e| {
@@ -928,7 +929,6 @@ async fn process_unzip_file(
         .map(|imported_collab| CollabParams {
           object_id: imported_collab.object_id,
           collab_type: imported_collab.collab_type,
-          embeddings: None,
           encoded_collab_v1: Bytes::from(imported_collab.encoded_collab.encode_to_bytes().unwrap()),
         })
         .collect::<Vec<_>>(),
@@ -1013,7 +1013,6 @@ async fn process_unzip_file(
     let w_database_collab_params = CollabParams {
       object_id: w_database_id.clone(),
       collab_type: CollabType::WorkspaceDatabase,
-      embeddings: None,
       encoded_collab_v1: Bytes::from(w_database_collab.encode_to_bytes().unwrap()),
     };
     collab_params_list.push(w_database_collab_params);
@@ -1054,7 +1053,6 @@ async fn process_unzip_file(
   let folder_collab_params = CollabParams {
     object_id: import_task.workspace_id.clone(),
     collab_type: CollabType::Folder,
-    embeddings: None,
     encoded_collab_v1: Bytes::from(folder_collab.encode_to_bytes().unwrap()),
   };
   trace!(

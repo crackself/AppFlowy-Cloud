@@ -1,9 +1,8 @@
 use crate::dto::{
   AIModel, CalculateSimilarityParams, ChatAnswer, ChatQuestion, CompleteTextResponse,
-  CompletionType, CreateChatContext, CustomPrompt, Document, EmbeddingRequest, EmbeddingResponse,
-  LocalAIConfig, MessageData, RepeatedLocalAIPackage, RepeatedRelatedQuestion,
-  SearchDocumentsRequest, SimilarityResponse, SummarizeRowResponse, TranslateRowData,
-  TranslateRowResponse,
+  CompletionType, CreateChatContext, CustomPrompt, Document, LocalAIConfig, MessageData,
+  RepeatedLocalAIPackage, RepeatedRelatedQuestion, SearchDocumentsRequest, SimilarityResponse,
+  SummarizeRowResponse, TranslateRowData, TranslateRowResponse,
 };
 use crate::error::AIError;
 
@@ -144,38 +143,6 @@ impl AppFlowyAIClient {
     AIResponse::<TranslateRowResponse>::from_reqwest_response(resp)
       .await?
       .into_data()
-  }
-
-  pub fn embeddings(&self, params: EmbeddingRequest) -> Result<EmbeddingResponse, AIError> {
-    const MAX_RETRIES: u32 = 2;
-    const RETRY_DELAY: Duration = Duration::from_secs(2);
-    let url = format!("{}/embeddings", self.url);
-    let mut retries = 0;
-
-    loop {
-      let result = ureq::post(&url).send_json(params.clone());
-      match result {
-        Ok(resp) => {
-          return AIResponse::<EmbeddingResponse>::from_ur_response(resp)?.into_data();
-        },
-        Err(err) => {
-          if matches!(err, ureq::Error::Transport(_)) {
-            return Err(AIError::InvalidRequest(err.to_string()));
-          }
-
-          retries += 1;
-          if retries >= MAX_RETRIES {
-            tracing::error!(
-              "embeddings request failed after {} retries: {:?}",
-              retries,
-              err
-            );
-            return Err(AIError::Internal(err.into()));
-          }
-          std::thread::sleep(RETRY_DELAY);
-        },
-      }
-    }
   }
 
   pub async fn search_documents(
@@ -406,6 +373,11 @@ where
     resp: reqwest::Response,
   ) -> Result<impl Stream<Item = Result<Bytes, AIError>>, AIError> {
     let status_code = resp.status();
+    if status_code.is_server_error() {
+      let body = resp.text().await?;
+      return Err(AIError::ServiceUnavailable(body));
+    }
+
     if !status_code.is_success() {
       let body = resp.text().await?;
       return Err(AIError::InvalidRequest(body));
@@ -418,16 +390,29 @@ where
 }
 impl From<reqwest::Error> for AIError {
   fn from(error: reqwest::Error) -> Self {
+    if error.is_connect() {
+      return AIError::ServiceUnavailable(error.to_string());
+    }
+
     if error.is_timeout() {
       return AIError::RequestTimeout(error.to_string());
     }
 
-    if error.is_request() {
-      return if error.status() == Some(StatusCode::PAYLOAD_TOO_LARGE) {
-        AIError::PayloadTooLarge(error.to_string())
-      } else {
-        AIError::InvalidRequest(format!("{:?}", error))
-      };
+    // Handle request-related errors
+    if let Some(status_code) = error.status() {
+      if error.is_request() {
+        match status_code {
+          StatusCode::PAYLOAD_TOO_LARGE => {
+            return AIError::PayloadTooLarge(error.to_string());
+          },
+          status_code if status_code.is_server_error() => {
+            return AIError::ServiceUnavailable(error.to_string());
+          },
+          _ => {
+            return AIError::InvalidRequest(format!("{:?}", error));
+          },
+        }
+      }
     }
     AIError::Internal(error.into())
   }

@@ -1,28 +1,33 @@
-use crate::config::get_env_var;
-use crate::indexer::DocumentIndexer;
-use crate::thread_pool_no_abort::ThreadPoolNoAbort;
+use crate::collab_indexer::DocumentIndexer;
+use crate::vector::embedder::Embedder;
 use app_error::AppError;
-use appflowy_ai_client::client::AppFlowyAIClient;
+use appflowy_ai_client::dto::EmbeddingModel;
 use collab::preclude::Collab;
 use collab_entity::CollabType;
 use database_entity::dto::{AFCollabEmbeddedChunk, AFCollabEmbeddings};
+use infra::env_util::get_env_var;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::info;
 
 pub trait Indexer: Send + Sync {
-  fn create_embedded_chunks(&self, collab: &Collab)
-    -> Result<Vec<AFCollabEmbeddedChunk>, AppError>;
+  fn create_embedded_chunks_from_collab(
+    &self,
+    collab: &Collab,
+    model: EmbeddingModel,
+  ) -> Result<Vec<AFCollabEmbeddedChunk>, AppError>;
+
+  fn create_embedded_chunks_from_text(
+    &self,
+    object_id: String,
+    text: String,
+    model: EmbeddingModel,
+  ) -> Result<Vec<AFCollabEmbeddedChunk>, AppError>;
 
   fn embed(
     &self,
+    embedder: &Embedder,
     content: Vec<AFCollabEmbeddedChunk>,
-  ) -> Result<Option<AFCollabEmbeddings>, AppError>;
-
-  fn embed_in_thread_pool(
-    &self,
-    content: Vec<AFCollabEmbeddedChunk>,
-    thread_pool: &ThreadPoolNoAbort,
   ) -> Result<Option<AFCollabEmbeddings>, AppError>;
 }
 
@@ -33,7 +38,7 @@ pub struct IndexerProvider {
 }
 
 impl IndexerProvider {
-  pub fn new(ai_client: AppFlowyAIClient) -> Arc<Self> {
+  pub fn new() -> Arc<Self> {
     let mut cache: HashMap<CollabType, Arc<dyn Indexer>> = HashMap::new();
     let enabled = get_env_var("APPFLOWY_INDEXER_ENABLED", "true")
       .parse::<bool>()
@@ -41,7 +46,7 @@ impl IndexerProvider {
 
     info!("Indexer is enabled: {}", enabled);
     if enabled {
-      cache.insert(CollabType::Document, DocumentIndexer::new(ai_client));
+      cache.insert(CollabType::Document, Arc::new(DocumentIndexer));
     }
     Arc::new(Self {
       indexer_cache: cache,
@@ -53,5 +58,9 @@ impl IndexerProvider {
   /// returns `None`.
   pub fn indexer_for(&self, collab_type: &CollabType) -> Option<Arc<dyn Indexer>> {
     self.indexer_cache.get(collab_type).cloned()
+  }
+
+  pub fn is_indexing_enabled(&self, collab_type: &CollabType) -> bool {
+    self.indexer_cache.contains_key(collab_type)
   }
 }
