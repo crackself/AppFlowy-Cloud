@@ -640,11 +640,13 @@ impl TestClient {
     input: &str,
     expected: &str,
     score: f64,
+    use_embedding: bool,
   ) {
     let params = CalculateSimilarityParams {
       workspace_id: workspace_id.to_string(),
       input: input.to_string(),
       expected: expected.to_string(),
+      use_embedding,
     };
     let resp = self.api_client.calculate_similarity(params).await.unwrap();
     assert!(
@@ -1269,6 +1271,7 @@ pub async fn collect_answer(mut stream: QuestionStream) -> String {
         answer.push_str(&value);
       },
       QuestionStreamValue::Metadata { .. } => {},
+      QuestionStreamValue::KeepAlive => {},
     }
   }
   answer

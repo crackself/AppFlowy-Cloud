@@ -11,8 +11,8 @@ use pin_project::pin_project;
 use reqwest::Method;
 use serde_json::Value;
 use shared_entity::dto::ai_dto::{
-  CalculateSimilarityParams, RepeatedRelatedQuestion, SimilarityResponse, STREAM_ANSWER_KEY,
-  STREAM_METADATA_KEY,
+  CalculateSimilarityParams, ChatQuestionQuery, RepeatedRelatedQuestion, SimilarityResponse,
+  STREAM_ANSWER_KEY, STREAM_IMAGE_KEY, STREAM_KEEP_ALIVE_KEY, STREAM_METADATA_KEY,
 };
 use shared_entity::dto::chat_dto::{ChatSettings, UpdateChatParams};
 use shared_entity::response::{AppResponse, AppResponseError};
@@ -166,6 +166,26 @@ impl Client {
           app_err
         }
       })?;
+    log_request_id(&resp);
+    let stream = AppResponse::<serde_json::Value>::json_response_stream(resp).await?;
+    Ok(QuestionStream::new(stream))
+  }
+
+  pub async fn stream_answer_v3(
+    &self,
+    workspace_id: &str,
+    query: ChatQuestionQuery,
+  ) -> Result<QuestionStream, AppResponseError> {
+    let url = format!(
+      "{}/api/chat/{workspace_id}/{}/answer/stream",
+      self.base_url, query.chat_id
+    );
+    let resp = self
+      .http_client_with_auth(Method::POST, &url)
+      .await?
+      .json(&query)
+      .send()
+      .await?;
     log_request_id(&resp);
     let stream = AppResponse::<serde_json::Value>::json_response_stream(resp).await?;
     Ok(QuestionStream::new(stream))
@@ -346,6 +366,7 @@ pub enum QuestionStreamValue {
   Metadata {
     value: serde_json::Value,
   },
+  KeepAlive,
 }
 impl Stream for QuestionStream {
   type Item = Result<QuestionStreamValue, AppResponseError>;
@@ -365,6 +386,17 @@ impl Stream for QuestionStream {
             .and_then(|s| s.as_str().map(ToString::to_string))
           {
             return Poll::Ready(Some(Ok(QuestionStreamValue::Answer { value: answer })));
+          }
+
+          if let Some(image) = value
+            .remove(STREAM_IMAGE_KEY)
+            .and_then(|s| s.as_str().map(ToString::to_string))
+          {
+            return Poll::Ready(Some(Ok(QuestionStreamValue::Answer { value: image })));
+          }
+
+          if value.remove(STREAM_KEEP_ALIVE_KEY).is_some() {
+            return Poll::Ready(Some(Ok(QuestionStreamValue::KeepAlive)));
           }
 
           error!("Invalid streaming value: {:?}", value);

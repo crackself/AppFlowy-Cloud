@@ -9,7 +9,10 @@ use serde::Deserialize;
 
 use crate::api::util::ai_model_from_header;
 use app_error::AppError;
-use appflowy_ai_client::dto::{CreateChatContext, RepeatedRelatedQuestion};
+use appflowy_ai_client::dto::{
+  ChatQuestion, ChatQuestionQuery, CreateChatContext, MessageData, QuestionMetadata,
+  RepeatedRelatedQuestion,
+};
 use authentication::jwt::UserUuid;
 use bytes::Bytes;
 use database::chat;
@@ -86,7 +89,11 @@ pub fn chat_scope() -> Scope {
       )
       .service(
         web::resource("/{chat_id}/{message_id}/v2/answer/stream")
-            .route(web::get().to(answer_stream_v2_handler))
+            .route(web::get().to(answer_stream_v2_handler))  // Deprecated since 0.9.2
+      )
+      .service(
+        web::resource("/{chat_id}/answer/stream")
+            .route(web::post().to(answer_stream_v3_handler))
       )
 
       // Additional functionality
@@ -134,13 +141,22 @@ async fn create_chat_context_handler(
 }
 
 async fn update_question_handler(
+  path: web::Path<(String, String)>,
   state: Data<AppState>,
   payload: Json<UpdateChatMessageContentParams>,
   req: HttpRequest,
 ) -> actix_web::Result<JsonAppResponse<()>> {
+  let (workspace_id, _chat_id) = path.into_inner();
   let params = payload.into_inner();
   let ai_model = ai_model_from_header(&req);
-  update_chat_message(&state.pg_pool, params, state.ai_client.clone(), ai_model).await?;
+  update_chat_message(
+    workspace_id,
+    &state.pg_pool,
+    params,
+    state.ai_client.clone(),
+    ai_model,
+  )
+  .await?;
   Ok(AppResponse::Ok().into())
 }
 
@@ -230,9 +246,10 @@ async fn answer_handler(
   state: Data<AppState>,
   req: HttpRequest,
 ) -> actix_web::Result<JsonAppResponse<ChatMessage>> {
-  let (_workspace_id, chat_id, message_id) = path.into_inner();
+  let (workspace_id, chat_id, message_id) = path.into_inner();
   let ai_model = ai_model_from_header(&req);
   let message = generate_chat_message_answer(
+    workspace_id,
     &state.pg_pool,
     state.ai_client.clone(),
     message_id,
@@ -249,14 +266,21 @@ async fn answer_stream_handler(
   state: Data<AppState>,
   req: HttpRequest,
 ) -> actix_web::Result<HttpResponse> {
-  let (_workspace_id, chat_id, question_id) = path.into_inner();
+  let (workspace_id, chat_id, question_id) = path.into_inner();
   let (content, metadata) =
     chat::chat_ops::select_chat_message_content(&state.pg_pool, question_id).await?;
   let rag_ids = chat::chat_ops::select_chat_rag_ids(&state.pg_pool, &chat_id).await?;
   let ai_model = ai_model_from_header(&req);
   match state
     .ai_client
-    .stream_question(&chat_id, &content, Some(metadata), rag_ids, &ai_model)
+    .stream_question(
+      workspace_id,
+      &chat_id,
+      &content,
+      Some(metadata),
+      rag_ids,
+      &ai_model,
+    )
     .await
   {
     Ok(answer_stream) => {
@@ -283,7 +307,7 @@ async fn answer_stream_v2_handler(
   state: Data<AppState>,
   req: HttpRequest,
 ) -> actix_web::Result<HttpResponse> {
-  let (_workspace_id, chat_id, question_id) = path.into_inner();
+  let (workspace_id, chat_id, question_id) = path.into_inner();
   let (content, metadata) =
     chat::chat_ops::select_chat_message_content(&state.pg_pool, question_id).await?;
   let rag_ids = chat::chat_ops::select_chat_rag_ids(&state.pg_pool, &chat_id).await?;
@@ -298,6 +322,7 @@ async fn answer_stream_v2_handler(
   match state
     .ai_client
     .stream_question_v2(
+      workspace_id,
       &chat_id,
       question_id,
       &content,
@@ -305,6 +330,57 @@ async fn answer_stream_v2_handler(
       rag_ids,
       &ai_model,
     )
+    .await
+  {
+    Ok(answer_stream) => {
+      let new_answer_stream = answer_stream.map_err(AppError::from);
+      Ok(
+        HttpResponse::Ok()
+          .content_type("text/event-stream")
+          .streaming(new_answer_stream),
+      )
+    },
+    Err(err) => Ok(
+      HttpResponse::ServiceUnavailable()
+        .content_type("text/event-stream")
+        .streaming(stream::once(async move {
+          Err(AppError::AIServiceUnavailable(err.to_string()))
+        })),
+    ),
+  }
+}
+
+#[instrument(level = "debug", skip_all, err)]
+async fn answer_stream_v3_handler(
+  path: web::Path<(String, String)>,
+  payload: Json<ChatQuestionQuery>,
+  state: Data<AppState>,
+  req: HttpRequest,
+) -> actix_web::Result<HttpResponse> {
+  let (workspace_id, _) = path.into_inner();
+  let payload = payload.into_inner();
+  let (content, metadata) =
+    chat::chat_ops::select_chat_message_content(&state.pg_pool, payload.question_id).await?;
+  let rag_ids = chat::chat_ops::select_chat_rag_ids(&state.pg_pool, &payload.chat_id).await?;
+  let ai_model = ai_model_from_header(&req);
+
+  let question = ChatQuestion {
+    chat_id: payload.chat_id,
+    data: MessageData {
+      content: content.to_string(),
+      metadata: Some(metadata),
+      message_id: Some(payload.question_id.to_string()),
+    },
+    format: payload.format,
+    metadata: QuestionMetadata {
+      workspace_id,
+      rag_ids,
+    },
+  };
+  trace!("[Chat] stream v3 {:?}", question);
+  match state
+    .ai_client
+    .stream_question_v3(&ai_model, question, Some(60))
     .await
   {
     Ok(answer_stream) => {
