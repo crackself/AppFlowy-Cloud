@@ -27,6 +27,7 @@ pub struct Config {
   pub mailer: MailerSetting,
   pub apple_oauth: AppleOAuthSetting,
   pub appflowy_web_url: Option<String>,
+  pub admin_frontend_path_prefix: String,
 }
 
 #[derive(serde::Deserialize, Clone, Debug)]
@@ -97,8 +98,6 @@ impl AppFlowyAISetting {
 pub struct ApplicationSetting {
   pub port: u16,
   pub host: String,
-  pub server_key: Secret<String>,
-  pub use_tls: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -209,10 +208,6 @@ pub fn get_configuration() -> Result<Config, anyhow::Error> {
     application: ApplicationSetting {
       port: get_env_var("APPFLOWY_APPLICATION_PORT", "8000").parse()?,
       host: get_env_var("APPFLOWY_APPLICATION_HOST", "0.0.0.0"),
-      use_tls: get_env_var("APPFLOWY_APPLICATION_USE_TLS", "false")
-        .parse()
-        .context("fail to get APPFLOWY_APPLICATION_USE_TLS")?,
-      server_key: get_env_var("APPFLOWY_APPLICATION_SERVER_KEY", "server_key").into(),
     },
     websocket: WebsocketSetting {
       heartbeat_interval: get_env_var("APPFLOWY_WEBSOCKET_HEARTBEAT_INTERVAL", "6").parse()?,
@@ -268,6 +263,7 @@ pub fn get_configuration() -> Result<Config, anyhow::Error> {
       client_secret: get_env_var("APPFLOWY_APPLE_OAUTH_CLIENT_SECRET", "").into(),
     },
     appflowy_web_url: get_env_var_opt("APPFLOWY_WEB_URL"),
+    admin_frontend_path_prefix: get_env_var("APPFLOWY_ADMIN_FRONTEND_PATH_PREFIX", ""),
   };
   Ok(config)
 }
